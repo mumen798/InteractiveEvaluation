@@ -226,6 +226,58 @@ class Recommender(object):
 
         return loss
 
+    def get_loss(self, ex):
+        """Forward a batch of examples; step the optimizer to update weights."""
+        # Train mode
+        self.network.train()
+
+        source_map, alignment = None, None
+        # To enable copy attn, collect source map and alignment info
+        if self.args.copy_attn:
+            assert 'src_map' in ex and 'alignment' in ex
+
+            source_map = make_src_map(ex['src_map'])
+            source_map = source_map.cuda(non_blocking=True) if self.use_cuda \
+                else source_map
+
+            alignment = align(ex['alignment'])
+            alignment = alignment.cuda(non_blocking=True) if self.use_cuda \
+                else alignment
+
+        # all tensors are of shape: # bsz x sess_len-1 x max_len
+        source_words = ex['source_words']
+        target_words = ex['target_words']
+        target_seq = ex['target_seq']
+        # all tensors are of shape: # bsz x sess_len-1
+        source_lens = ex['source_lens']
+        target_lens = ex['target_lens']
+
+        if self.type in ['SEQ2SEQ', 'ACG']:
+            # sess_len-1 = 1
+            source_words = source_words.squeeze(1)
+            target_words = target_words.squeeze(1)
+            target_seq = target_seq.squeeze(1)
+            source_lens = source_lens.squeeze(1)
+            target_lens = target_lens.squeeze(1)
+
+        if self.use_cuda:
+            source_words = source_words.cuda(non_blocking=True)
+            source_lens = source_lens.cuda(non_blocking=True)
+            target_words = target_words.cuda(non_blocking=True)
+            target_lens = target_lens.cuda(non_blocking=True)
+            target_seq = target_seq.cuda(non_blocking=True)
+
+        # Run forward
+        loss = self.network.compute_loss(source_rep=source_words,
+                            source_len=source_lens,
+                            target_rep=target_words,
+                            target_len=target_lens,
+                            target_seq=target_seq,
+                            source_map=source_map,
+                            alignment=alignment)
+
+        return loss
+
     # --------------------------------------------------------------------------
     # Prediction
     # --------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import logging
 import subprocess
 import argparse
 import numpy as np
+import json
 
 import neuroir.config as config
 from tqdm import tqdm
@@ -19,16 +20,18 @@ from collections import OrderedDict
 from neuroir.utils.timer import AverageMeter, Timer
 import neuroir.inputters.recommender.vector as vector
 from neuroir.inputters.recommender import data, utils
+from neuroir.objects import Query
+from neuroir.inputters.constants import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD
 
 from neuroir.models.recommender import Recommender
-from neuroir.utils.misc import normalize_string
+from neuroir.utils.misc import normalize_string, count_file_lines
 from neuroir.eval.bleu import Bleu
 from neuroir.eval.rouge import Rouge
 from neuroir.eval.squad_eval import metric_max_over_ground_truths, \
     f1_score, exact_match_score
 
 logger = logging.getLogger()
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 def str2bool(v):
@@ -60,6 +63,7 @@ def add_train_args(parser):
                          help='Batch size for training')
     runtime.add_argument('--test_batch_size', type=int, default=128,
                          help='Batch size during validation/testing')
+    runtime.add_argument('--num_samples', type=int, default=128)
 
     # Files
     files = parser.add_argument_group('Filesystem')
@@ -117,6 +121,7 @@ def add_train_args(parser):
                          help='Sort batches by length for speed')
     general.add_argument('--only_test', type='bool', default=False,
                          help='Only do testing')
+    general.add_argument('--active_test', type='bool', default=False)
 
     # Log results Learning
     log = parser.add_argument_group('Log arguments')
@@ -246,6 +251,29 @@ def train(args, data_loader, model, global_stats):
         model.checkpoint(args.model_file + '.checkpoint', global_stats['epoch'] + 1)
 
 
+def get_active_sampler(args, data_loader, model, num_samples):
+
+    pbar = tqdm(data_loader)
+
+    # Run one epoch
+    weights = []
+    for idx, ex in enumerate(pbar):
+        bsz = ex['batch_size']
+        net_loss = model.get_loss(ex)
+        net_loss = net_loss.tolist()
+        weights = weights + net_loss
+
+        torch.cuda.empty_cache()
+
+    weights = torch.tensor(weights, device='cuda')
+
+    sampler = torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=num_samples, replacement=False)
+
+    return sampler, weights
+
+
+
+
 # ------------------------------------------------------------------------------
 # Validation loops. Includes both "unofficial" and "official" functions that
 # use different metrics and implementations.
@@ -264,11 +292,15 @@ def validate_official(args, data_loader, model, global_stats=None):
     # Run through examples
     examples = 0
     sources, hypotheses, references = dict(), dict(), dict()
+    loss = []
     with torch.no_grad():
         pbar = tqdm(data_loader)
         for ex in pbar:
             batch_size = ex['batch_size'] * ex['session_len']
             outputs = model.predict(ex)
+            net_loss = model.get_loss(ex)
+            net_loss = net_loss.tolist()
+            loss = loss + net_loss
 
             ex_ids = outputs['ex_ids']
             predictions = outputs['predictions']
@@ -318,7 +350,9 @@ def validate_official(args, data_loader, model, global_stats=None):
                      result['f1'], examples) +
                     'valid time = %.2f (s)' % eval_time.time())
 
-    return result
+    mean_loss = sum(loss) / len(loss)
+    print("mean_loss:"+str(mean_loss))
+    return result, loss
 
 
 def eval_accuracies(hypotheses, references, copy_info, sources=None,
@@ -524,6 +558,39 @@ def main(args):
     logger.info('-' * 100)
     logger.info('Starting evaluation...')
     # --------------------------------------------------------------------------
+    if args.active_test:
+        active_exs = utils.load_data(args, args.test_file,
+                                     max_examples=args.max_examples,
+                                     dataset_name=args.dataset_name)
+        logger.info('Num active examples = %d' % len(active_exs))
+
+        active_exs = active_exs[0:160768]
+        filename = '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg_test.json'
+        with open(filename) as f:
+            datas = [json.loads(line) for line in
+                    tqdm(f, total=count_file_lines(filename))]
+        for i in range(len(active_exs)):
+            qObj = Query(i)
+            qObj.text = ' '.join(datas[i]['predictions'])
+            qTokens = qObj.text.split()
+            qTokens = [BOS_WORD] + qTokens + [EOS_WORD]
+            qObj.tokens = qTokens
+            active_exs[i].queries[1] = qObj
+
+        active_dataset = data.RecommenderDataset(active_exs, model)
+
+        active_loader = torch.utils.data.DataLoader(
+            active_dataset,
+            batch_size=args.test_batch_size,
+            num_workers=args.data_workers,
+            shuffle=False,
+            collate_fn=vector.batchify,
+            pin_memory=args.cuda,
+            drop_last=args.parallel
+        )
+
+        sampler, weights = get_active_sampler(args, active_loader, model, args.num_samples)
+
     test_exs = utils.load_data(args, args.test_file,
                                max_examples=args.max_examples,
                                dataset_name=args.dataset_name)
@@ -537,6 +604,11 @@ def main(args):
     else:
         test_sampler = torch.utils.data.sampler.SequentialSampler(test_dataset)
 
+    if args.active_test:
+        test_sampler = sampler
+    else:
+        test_sampler = torch.utils.data.sampler.RandomSampler(test_dataset, num_samples=args.num_samples, replacement=False)
+
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=args.test_batch_size,
@@ -546,8 +618,36 @@ def main(args):
         pin_memory=args.cuda,
         drop_last=args.parallel
     )
-    args.pred_file = os.path.join(args.model_dir, args.model_name + '_test.json')
-    validate_official(args, test_loader, model)
+    if args.active_test:
+        args.pred_file = os.path.join(args.model_dir, args.model_name + '_activeTest.json')
+    else:
+        args.pred_file = os.path.join(args.model_dir, args.model_name + '_test.json')
+    result, loss = validate_official(args, test_loader, model)
+    if args.active_test:
+        sample_index = [i for i in test_sampler]
+        N = 160768
+        M = args.num_samples
+        total_loss = 0
+        print(type(weights))
+        weights = weights.tolist()
+        sum_weights = sum(weights)
+        sum_l = 0
+        for i in sample_index:
+            sum_l = sum_l + weights[i]
+        s_loss = sum_l / M
+        print("loss:"+str(s_loss))
+        vm_list = []
+        for i in range(len(loss)):
+            m = i+1
+            vm = 1+(1/((N-m+1) * (weights[sample_index[i]]/sum_weights)) - 1) * (N-M) / (N-m)
+            vm_list.append(vm)
+        vm_sum = sum(vm_list)
+        # for i in range(len(vm_list)):
+        #     vm_list[i] = vm_list[i] / vm_sum
+        for i in range(len(loss)):
+            total_loss = total_loss + vm_list[i] * loss[i]
+        unbiased_loss = total_loss / M
+        print('unbiased_loss:'+str(unbiased_loss))
 
 
 if __name__ == '__main__':

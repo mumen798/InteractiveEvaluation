@@ -102,6 +102,63 @@ class Seq2seq(nn.Module):
         ml_loss = ml_loss.sum(1).mean()
         return ml_loss
 
+    def compute_loss(self,
+                source_rep,
+                source_len,
+                target_rep,
+                target_len,
+                target_seq,
+                source_map,
+                alignment):
+        """
+        Input:
+            - source_rep: ``(batch_size, max_src_len)``
+            - source_len: ``(batch_size)``
+            - target_rep: ``(batch_size, max_tgt_len)``
+            - target_len: ``(batch_size)``
+            - target_seq: ``(batch_size, max_tgt_len)``
+        Output:
+            - loss: tensor with a single value
+        """
+
+        # batch_size x max_src_len x emsize
+        source_word_rep = self.embedder(source_rep)
+
+        # memory_bank: B x P x h; hidden: l*num_directions x B x h
+        hidden, memory_bank = self.encoder(source_word_rep, source_len)
+        memory_bank = self.dropout(memory_bank)
+
+        # batch_size x max_src_len x emsize
+        target_word_rep = self.embedder(target_rep)
+
+        init_decoder_state = self.decoder.init_decoder(hidden)
+        decoder_outputs, attns = self.decoder(target_word_rep,
+                                              memory_bank,
+                                              source_len,
+                                              init_decoder_state)
+
+        target = target_seq[:, 1:].contiguous()
+        if self.copy_attn:
+            scores = self.copy_generator(decoder_outputs,
+                                         attns["copy"],
+                                         source_map)
+            scores = scores[:, :-1, :].contiguous()
+            ml_loss = self.criterion(scores,
+                                     alignment[:, 1:].contiguous(),
+                                     target)
+        else:
+            scores = self.generator(decoder_outputs)  # `batch x max_tgt_len x vocab_size`
+            scores = scores[:, :-1, :].contiguous()  # `batch x max_tgt_len - 1 x vocab_size`
+            logll = self.log_softmax(scores)
+            ml_loss = f.nll_loss(logll.view(-1, logll.size(2)),
+                                 target.view(-1),
+                                 reduce=False)
+
+        ml_loss = ml_loss.view(*scores.size()[:-1])
+        ml_loss = ml_loss.mul(target.ne(constants.PAD).float())
+
+        return ml_loss.sum(1)
+
     def __tens2sent(self, t, tgt_dict, src_vocabs):
         words = []
         for idx, w in enumerate(t):

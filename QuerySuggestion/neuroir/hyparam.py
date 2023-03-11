@@ -122,7 +122,7 @@ SEQ2SEQ = {
 HREDQS = {
     'arch': {
         'rnn_type': 'LSTM',
-        'bidirection': False,
+        'bidirection': True,
         'nlayers': 1,
         'nhid': 512,
         'dropout_rnn': 0.2,
