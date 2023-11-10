@@ -13,6 +13,7 @@ import subprocess
 import argparse
 import numpy as np
 import json
+import csv
 
 import neuroir.config as config
 from tqdm import tqdm
@@ -31,7 +32,7 @@ from neuroir.eval.squad_eval import metric_max_over_ground_truths, \
     f1_score, exact_match_score
 
 logger = logging.getLogger()
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 
 def str2bool(v):
@@ -252,26 +253,31 @@ def train(args, data_loader, model, global_stats):
 
 
 def get_active_sampler(args, data_loader, model, num_samples):
-
     pbar = tqdm(data_loader)
 
     # Run one epoch
     weights = []
+    weights_sum = 0
     for idx, ex in enumerate(pbar):
         bsz = ex['batch_size']
         net_loss = model.get_loss(ex)
+        # weights_sum += net_loss
         net_loss = net_loss.tolist()
         weights = weights + net_loss
 
         torch.cuda.empty_cache()
+
+    # for i in range(len(weights)):
+    #     if weights[i] / weights_sum > 0.2 / args.num_samples:
+    #         weights[i] = weights[i] / weights_sum
+    #     else:
+    #         weights[i] = 0.2 / args.num_samples
 
     weights = torch.tensor(weights, device='cuda')
 
     sampler = torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=num_samples, replacement=False)
 
     return sampler, weights
-
-
 
 
 # ------------------------------------------------------------------------------
@@ -293,11 +299,14 @@ def validate_official(args, data_loader, model, global_stats=None):
     examples = 0
     sources, hypotheses, references = dict(), dict(), dict()
     loss = []
+    s_list = []
+    h_list = []
+    r_list = []
     with torch.no_grad():
         pbar = tqdm(data_loader)
         for ex in pbar:
             batch_size = ex['batch_size'] * ex['session_len']
-            outputs = model.predict(ex)
+            outputs = model.predict(ex, temperature=0.5)
             net_loss = model.get_loss(ex)
             net_loss = net_loss.tolist()
             loss = loss + net_loss
@@ -308,11 +317,21 @@ def validate_official(args, data_loader, model, global_stats=None):
             src_sequences = outputs['src_sequences']
             examples += batch_size
 
+            s_dict, h_dict, r_dict = dict(), dict(), dict()
             for key, src, pred, tgt in zip(ex_ids, src_sequences, predictions, targets):
                 hypotheses[key] = [normalize_string(p) for p in pred] \
                     if isinstance(pred, list) else [normalize_string(pred)]
                 references[key] = [normalize_string(t) for t in tgt]
                 sources[key] = src
+
+                h_dict[key] = [normalize_string(p) for p in pred] \
+                    if isinstance(pred, list) else [normalize_string(pred)]
+                r_dict[key] = [normalize_string(t) for t in tgt]
+                s_dict[key] = src
+
+                s_list.append(s_dict)
+                h_list.append(h_dict)
+                r_list.append(r_dict)
 
             if global_stats is not None:
                 pbar.set_description("%s" % 'Epoch = %d [validating ... ]' % global_stats['epoch'])
@@ -323,7 +342,7 @@ def validate_official(args, data_loader, model, global_stats=None):
                                                    references,
                                                    None,
                                                    sources=sources,
-                                                   filename=args.pred_file,
+                                                   filename=None,
                                                    print_copy_info=args.print_copy_info)
 
     bleu = [b * 100 for b in bleu] \
@@ -351,8 +370,32 @@ def validate_official(args, data_loader, model, global_stats=None):
                     'valid time = %.2f (s)' % eval_time.time())
 
     mean_loss = sum(loss) / len(loss)
-    print("mean_loss:"+str(mean_loss))
-    return result, loss
+    print("mean_loss:" + str(mean_loss))
+
+    result_list = []
+    for i in range(len(s_list)):
+        bleu, rouge, exact_match, f1 = eval_accuracies(h_list[i],
+                                                       r_list[i],
+                                                       None,
+                                                       sources=s_list[i],
+                                                       filename=None,
+                                                       print_copy_info=args.print_copy_info)
+        bleu = [b * 100 for b in bleu] \
+            if isinstance(bleu, list) else bleu
+        result_dict = dict()
+        result_dict['rouge'] = rouge
+        result_dict['bleu'] = sum(bleu) / len(bleu) \
+            if isinstance(bleu, list) else bleu
+        result_dict['b1'] = bleu[0]
+        result_dict['b2'] = bleu[1]
+        result_dict['b3'] = bleu[2]
+        result_dict['b4'] = bleu[3]
+        result_dict['em'] = exact_match
+        result_dict['f1'] = f1
+
+        result_list.append(result_dict)
+
+    return result, loss, result_list
 
 
 def eval_accuracies(hypotheses, references, copy_info, sources=None,
@@ -558,6 +601,7 @@ def main(args):
     logger.info('-' * 100)
     logger.info('Starting evaluation...')
     # --------------------------------------------------------------------------
+    weights_list = []
     if args.active_test:
         active_exs = utils.load_data(args, args.test_file,
                                      max_examples=args.max_examples,
@@ -565,35 +609,70 @@ def main(args):
         logger.info('Num active examples = %d' % len(active_exs))
 
         active_exs = active_exs[0:160768]
-        filename = '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg_test.json'
-        with open(filename) as f:
-            datas = [json.loads(line) for line in
-                    tqdm(f, total=count_file_lines(filename))]
-        for i in range(len(active_exs)):
-            qObj = Query(i)
-            qObj.text = ' '.join(datas[i]['predictions'])
-            qTokens = qObj.text.split()
-            qTokens = [BOS_WORD] + qTokens + [EOS_WORD]
-            qObj.tokens = qTokens
-            active_exs[i].queries[1] = qObj
+        # filename = '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg_test.json'
+        filenames = ['/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg_test.json',
+                     '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg01_test.json',
+                     '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg02_test.json',
+                     '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg03_test.json',
+                     '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg04_test.json',
+                     '/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg05_test.json']
+        filenames = ['/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/acg_test.json']
 
-        active_dataset = data.RecommenderDataset(active_exs, model)
+        for filename in filenames:
+            with open(filename) as f:
+                datas = [json.loads(line) for line in
+                         tqdm(f, total=count_file_lines(filename))]
+            for i in range(len(active_exs)):
+                qObj = Query(i)
+                qObj.text = ' '.join(datas[i]['predictions'])
+                qTokens = qObj.text.split()
+                qTokens = [BOS_WORD] + qTokens + [EOS_WORD]
+                qObj.tokens = qTokens
+                active_exs[i].queries[1] = qObj
 
-        active_loader = torch.utils.data.DataLoader(
-            active_dataset,
-            batch_size=args.test_batch_size,
-            num_workers=args.data_workers,
-            shuffle=False,
-            collate_fn=vector.batchify,
-            pin_memory=args.cuda,
-            drop_last=args.parallel
-        )
+            active_dataset = data.RecommenderDataset(active_exs, model)
 
-        sampler, weights = get_active_sampler(args, active_loader, model, args.num_samples)
+            active_loader = torch.utils.data.DataLoader(
+                active_dataset,
+                batch_size=args.test_batch_size,
+                num_workers=args.data_workers,
+                shuffle=False,
+                collate_fn=vector.batchify,
+                pin_memory=args.cuda,
+                drop_last=args.parallel
+            )
 
+            # sampler, weights = get_active_sampler(args, active_loader, model, args.num_samples)
+            result, loss, result_list = validate_official(args, active_loader, model)
+            weights = []
+            for i in range(len(result_list)):
+                weights.append(result_list[i]['rouge'])
+            weights_list.append(weights)
+    weights = torch.tensor(weights_list)
+    # weights = torch.stack(weights_list, dim=0).mean(dim=0)
+    weights = weights.squeeze()
+
+    w_sum = 0
+    for i in range(len(weights)):
+        w_sum += weights[i]
+    for i in range(len(weights)):
+        if weights[i] / w_sum > 0.2 / 160768:
+            weights[i] = weights[i] / w_sum
+        else:
+            weights[i] = 0.2 / 160768
+    sampler = torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=args.num_samples, replacement=False)
     test_exs = utils.load_data(args, args.test_file,
                                max_examples=args.max_examples,
                                dataset_name=args.dataset_name)
+    sample_index = [i for i in sampler]
+    for i in range(len(sample_index)):
+        for j in range(i + 1, len(sample_index)):
+            if weights[i] < weights[j]:
+                sample_index[i], sample_index[j] = sample_index[j], sample_index[i]
+    test = []
+    for index in sample_index:
+        test.append(test_exs[index])
+    test_exs = test
     logger.info('Num test examples = %d' % len(test_exs))
 
     test_dataset = data.RecommenderDataset(test_exs, model)
@@ -604,15 +683,16 @@ def main(args):
     else:
         test_sampler = torch.utils.data.sampler.SequentialSampler(test_dataset)
 
-    if args.active_test:
-        test_sampler = sampler
-    else:
-        test_sampler = torch.utils.data.sampler.RandomSampler(test_dataset, num_samples=args.num_samples, replacement=False)
+    # if args.active_test:
+    #     test_sampler = sampler
+    # else:
+    #     test_sampler = torch.utils.data.sampler.RandomSampler(test_dataset, num_samples=args.num_samples, replacement=False)
 
+    # test_sampler = torch.utils.data.sampler.RandomSampler(test_dataset, num_samples=args.num_samples, replacement=False)
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=args.test_batch_size,
-        sampler=test_sampler,
+        shuffle=False,
         num_workers=args.data_workers,
         collate_fn=vector.batchify,
         pin_memory=args.cuda,
@@ -622,32 +702,69 @@ def main(args):
         args.pred_file = os.path.join(args.model_dir, args.model_name + '_activeTest.json')
     else:
         args.pred_file = os.path.join(args.model_dir, args.model_name + '_test.json')
-    result, loss = validate_official(args, test_loader, model)
+
+    result, loss, result_list = validate_official(args, test_loader, model)
+
     if args.active_test:
-        sample_index = [i for i in test_sampler]
         N = 160768
         M = args.num_samples
         total_loss = 0
-        print(type(weights))
         weights = weights.tolist()
         sum_weights = sum(weights)
-        sum_l = 0
-        for i in sample_index:
-            sum_l = sum_l + weights[i]
-        s_loss = sum_l / M
-        print("loss:"+str(s_loss))
+
         vm_list = []
         for i in range(len(loss)):
-            m = i+1
-            vm = 1+(1/((N-m+1) * (weights[sample_index[i]]/sum_weights)) - 1) * (N-M) / (N-m)
+            m = i + 1
+            if m != 160768:
+                vm = 1 + (1 / ((N - m + 1) * (weights[sample_index[i]])) - 1) * (N - M) / (N - m)
+            else:
+                vm = 1
             vm_list.append(vm)
         vm_sum = sum(vm_list)
         # for i in range(len(vm_list)):
         #     vm_list[i] = vm_list[i] / vm_sum
+
+        rouge, bleu, em, f1, b1, b2, b3, b4 = 0, 0, 0, 0, 0, 0, 0, 0
         for i in range(len(loss)):
             total_loss = total_loss + vm_list[i] * loss[i]
+            rouge += vm_list[i] * result_list[i]['rouge']
+            bleu += vm_list[i] * result_list[i]['bleu']
+            em += vm_list[i] * result_list[i]['em']
+            f1 += vm_list[i] * result_list[i]['f1']
+
+            b1 += vm_list[i] * result_list[i]['b1']
+            b2 += vm_list[i] * result_list[i]['b2']
+            b3 += vm_list[i] * result_list[i]['b3']
+            b4 += vm_list[i] * result_list[i]['b4']
+
+        # with open('/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/result.csv', 'w') as f:
+        #     for i in range(len(loss)):
+        #         write_data = [result_list[i]['rouge'], result_list[i]['b1'], result_list[i]['b2'],
+        #                       result_list[i]['b3'], result_list[i]['b4'], result_list[i]['em'],
+        #                       result_list[i]['f1'], loss[i], weights[i]]
+        #         writer = csv.writer(f)
+        #         writer.writerow(write_data)
+
         unbiased_loss = total_loss / M
-        print('unbiased_loss:'+str(unbiased_loss))
+        print('unbiased_loss:' + str(unbiased_loss))
+        rouge = rouge / M
+        print('rouge:' + str(rouge))
+        print("bleu:" + str(bleu))
+        em = em / M
+        print('em:' + str(em))
+        f1 = f1 / M
+        print("f1:" + str(f1))
+
+        b1 = b1 / M
+        print('b1:' + str(b1))
+        b2 = b2 / M
+        print('b2:' + str(b2))
+        b3 = b3 / M
+        print('b3:' + str(b3))
+        b4 = b4 / M
+        print('b4:' + str(b4))
+
+        return rouge, result['rouge']
 
 
 if __name__ == '__main__':
@@ -661,31 +778,45 @@ if __name__ == '__main__':
     args = parser.parse_args()
     set_defaults(args)
 
-    # Set cuda
-    args.cuda = torch.cuda.is_available()
-    args.parallel = torch.cuda.device_count() > 1
+    seeds = [42, 912, 323, 2023, 1914, 1024, 10086, 406, 401, 318]
+    a_list = []
+    b_list = []
+    for seed in seeds:
+        # Set cuda
+        args.cuda = torch.cuda.is_available()
+        args.parallel = torch.cuda.device_count() > 1
 
-    # Set random state
-    np.random.seed(args.random_seed)
-    torch.manual_seed(args.random_seed)
-    if args.cuda:
-        torch.cuda.manual_seed(args.random_seed)
+        # Set random state
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if args.cuda:
+            torch.cuda.manual_seed(seed)
 
-    # Set logging
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter('%(asctime)s: [ %(message)s ]',
-                            '%m/%d/%Y %I:%M:%S %p')
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-    if args.log_file:
-        if args.checkpoint:
-            logfile = logging.FileHandler(args.log_file, 'a')
-        else:
-            logfile = logging.FileHandler(args.log_file, 'w')
-        logfile.setFormatter(fmt)
-        logger.addHandler(logfile)
-    logger.info('COMMAND: %s' % ' '.join(sys.argv))
+        # Set logging
+        logger.setLevel(logging.INFO)
+        fmt = logging.Formatter('%(asctime)s: [ %(message)s ]',
+                                '%m/%d/%Y %I:%M:%S %p')
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+        if args.log_file:
+            if args.checkpoint:
+                logfile = logging.FileHandler(args.log_file, 'a')
+            else:
+                logfile = logging.FileHandler(args.log_file, 'w')
+            logfile.setFormatter(fmt)
+            logger.addHandler(logfile)
+        logger.info('COMMAND: %s' % ' '.join(sys.argv))
 
-    # Run!
-    main(args)
+        # Run!
+        active, random = main(args)
+        a_list.append(active)
+        b_list.append(random)
+    active_mean = np.mean(a_list)
+    active_var = np.var(a_list)
+    random_mean = np.mean(b_list)
+    random_var = np.var(b_list)
+    with open('/home/qinpeixin/InteractiveEvaluation/QuerySuggestion/tmp/result512.csv', 'w') as f:
+        writer = csv.writer(f)
+        write_data = [active_mean, active_var, random_mean, random_var]
+        writer.writerow(write_data)

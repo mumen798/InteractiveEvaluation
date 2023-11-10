@@ -182,7 +182,8 @@ class Seq2seq(nn.Module):
                alignment,
                blank,
                fill,
-               source_vocabs):
+               source_vocabs,
+               temperature):
 
         batch_size = source_rep.size(0)
         use_cuda = source_rep.is_cuda
@@ -231,7 +232,12 @@ class Seq2seq(nn.Module):
                 prediction = self.generator(decoder_outputs.squeeze(1))
                 prediction = f.softmax(prediction, dim=1)
 
+            # prediction = self.generator(decoder_outputs.squeeze(1))
+            # prediction = prediction / temperature
+            # prediction = f.softmax(prediction, dim=1)
+
             tgt = torch.max(prediction, dim=1, keepdim=True)[1]
+            # tgt = torch.multinomial(prediction, 1)
             dec_preds.append(tgt.squeeze(1).clone())
             if "std" in attns:
                 attentions.append(attns["std"].squeeze(1))

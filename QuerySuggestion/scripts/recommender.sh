@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 SRC_DIR=../
-DATA_DIR=${SRC_DIR}/data/
-EMBED_DIR=${SRC_DIR}/data/fasttext/
+DATA_DIR=/data/qinpeixin/data/msmarco/
+EMBED_DIR=/data/qinpeixin/data/fasttext/
 MODEL_DIR=${SRC_DIR}/tmp/
 
 RGPU=$1
@@ -34,10 +34,12 @@ PYTHONPATH=$SRC_DIR CUDA_VISIBLE_DEVICES=$RGPU python -W ignore ${SRC_DIR}/main/
 	--checkpoint True \
 	--model_dir $MODEL_DIR \
 	--model_name $MODEL_NAME \
-	--only_test False \
+	--only_test True \
 	--data_workers 0 \
 	--dataset_name $DATASET \
 	--data_dir ${DATA_DIR}/${DATASET}/ \
 	--embed_dir $EMBED_DIR \
 	--embedding_file crawl-300d-2M-subword.vec \
-	--reuse_copy_attn False
+	--reuse_copy_attn False \
+	--active_test True \
+	--num_samples 160768

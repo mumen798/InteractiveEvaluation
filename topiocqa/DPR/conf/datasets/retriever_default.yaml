@@ -1,0 +1,25 @@
+# @package _group_
+
+topiocqa_train_original:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/original/train.csv
+
+topiocqa_dev_original:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/original/dev.csv
+
+topiocqa_train_all_history:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/all_history/train.csv
+
+topiocqa_dev_all_history:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/all_history/dev.csv
+
+topiocqa_train_rewrites_t5_qrecc:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/rewrites_t5_qrecc/train.csv
+
+topiocqa_dev_rewrites_t5_qrecc:
+  _target_: dpr.data.retriever_data.CsvQASrc
+  file: downloads/data/retriever/qas/rewrites_t5_qrecc/dev.csv

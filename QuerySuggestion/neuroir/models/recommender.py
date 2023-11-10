@@ -282,7 +282,7 @@ class Recommender(object):
     # Prediction
     # --------------------------------------------------------------------------
 
-    def predict(self, ex):
+    def predict(self, ex, temperature):
         """Forward a batch of examples only to get predictions.
         Args:
             ex: the batch examples
@@ -335,7 +335,8 @@ class Recommender(object):
                                  alignment=alignment,
                                  blank=blank,
                                  fill=fill,
-                                 source_vocabs=ex['src_vocab'])
+                                 source_vocabs=ex['src_vocab'],
+                                 temperature=temperature)
 
         outputs = dict()
         outputs['ex_ids'] = None

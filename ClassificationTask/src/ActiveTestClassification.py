@@ -7,7 +7,8 @@ import evaluate
 import os
 import csv
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ["WANDB_DISABLED"] = "true"
 
 ActiveTesting = True
 num_samples = 512
@@ -18,6 +19,7 @@ clip = 0.2
 
 bertTokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 ernieTokenizer = AutoTokenizer.from_pretrained("nghuyong/ernie-2.0-base-en")
+debertaTokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-large", cache_dir='/data/qinpeixin/huggingface')
 
 
 def bert_preprocess_function(examples):
@@ -40,6 +42,16 @@ def ernie_preprocess_function(examples):
     return result
 
 
+def deberta_preprocess_function(examples):
+    # Tokenize the texts
+    args = (
+        (examples["premise"], examples["hypothesis"])
+    )
+    result = debertaTokenizer(*args, padding="max_length", max_length=128, truncation=True)
+
+    return result
+
+
 metrics = evaluate.load("accuracy")
 
 
@@ -49,13 +61,14 @@ def compute_metrics(eval_pred):
     return metrics.compute(predictions=predictions, references=labels)
 
 
-def main(metric, num_samples, seed, clip, saveFile, sorted):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+def main(metric, num_samples_list, seed_list, clip):
+    np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
 
     bertConfig = AutoConfig.from_pretrained("bert-base-uncased", num_labels=3)
     ernieConfig = AutoConfig.from_pretrained("nghuyong/ernie-2.0-base-en", num_labels=3)
+    debertaConfig = AutoConfig.from_pretrained("microsoft/deberta-large", num_labels=3)
 
     bert = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", config=bertConfig,
                                                               ignore_mismatched_sizes=True, revision='main')
@@ -67,39 +80,51 @@ def main(metric, num_samples, seed, clip, saveFile, sorted):
     ernie.load_state_dict(torch.load(
         "/home/qinpeixin/InteractiveEvaluation/Classification/output/ernie/random_eval/checkpoint-1152/pytorch_model.bin"))
 
+    deberta = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-large", config=debertaConfig,
+                                                                 ignore_mismatched_sizes=True, revision='main',
+                                                                 cache_dir='/data/qinpeixin/huggingface')
+    deberta.load_state_dict(torch.load(
+        "/data/qinpeixin/models/deberta/large/mnli/pytorch_model.bin"))
+
     raw_datasets = datasets.load_dataset('glue', 'mnli')
 
     bert_datasets = raw_datasets.map(bert_preprocess_function, batched=True)
     ernie_datasets = raw_datasets.map(ernie_preprocess_function, batched=True)
+    deberta_datasets = raw_datasets.map(deberta_preprocess_function, batched=True)
 
     # random_sampler = torch.utils.data.sampler.RandomSampler(bert_datasets['validation_matched'], num_samples=num_samples, replacement=False)
-
-    random_eval_dataset = bert_datasets['validation_matched'].shuffle(seed=seed).select(range(num_samples))
-
-    training_args = TrainingArguments(
-        output_dir="/home/qinpeixin/InteractiveEvaluation/Classification/output/ernie/random_eval",
-        evaluation_strategy="epoch",
-        per_device_eval_batch_size=256,
-        per_device_train_batch_size=256,
-        fp16=True,
-        save_strategy='epoch'
-    )
 
     bert_datasets = bert_datasets.remove_columns(["premise", 'hypothesis', 'idx'])
     bert_datasets = bert_datasets.rename_column("label", "labels")
     bert_datasets.set_format("torch")
+
+    deberta_datasets = deberta_datasets.remove_columns(["premise", 'hypothesis', 'idx'])
+    deberta_datasets = deberta_datasets.rename_column("label", "labels")
+    deberta_datasets.set_format("torch")
+
     eval_dataloader = torch.utils.data.DataLoader(bert_datasets['validation_matched'], batch_size=1, shuffle=False)
+    deberta_eval_dataloader = torch.utils.data.DataLoader(deberta_datasets['validation_matched'], batch_size=1,
+                                                          shuffle=False)
+
     device = torch.device('cuda')
     bert = bert.to(device)
     ernie = ernie.to(device)
+    deberta = deberta.to(device)
 
     bert.eval()
     ernie.eval()
+    deberta.eval()
     weights = []
-    for batch in eval_dataloader:
+    true_loss = []
+    for i, data in enumerate(zip(eval_dataloader, deberta_eval_dataloader)):
+        batch = data[0]
+        batch2 = data[1]
+
         batch = {k: v.to(device) for k, v in batch.items()}
+        batch2 = {k: v.to(device) for k, v in batch2.items()}
         with torch.no_grad():
             outputs = bert(**batch)
+            # outputs2 = deberta(**batch2)
             outputs2 = ernie(**batch)
 
         logits = outputs.logits
@@ -109,11 +134,22 @@ def main(metric, num_samples, seed, clip, saveFile, sorted):
         if metric == 'loss':
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, 3), predictions.view(-1, 3)).item()
+            t_loss = outputs.loss.item()
         elif metric == 'accuracy':
             arg = torch.argmax(logits, dim=1).item()
-            loss = 1 - predictions[0][arg].item()
+            loss = (1 - predictions[0][arg].item()) * predictions[0][arg].item()
+            arg = torch.argmax(outputs.logits, dim=1).item()
+            if arg == batch['labels'].item():
+                t_loss = 0
+            else:
+                t_loss = 1
 
         weights.append(loss)
+        true_loss.append(t_loss)
+
+    true_loss_num = np.mean(true_loss)
+
+    save_weights = weights
 
     sum = 0
     for weight in weights:
@@ -122,105 +158,95 @@ def main(metric, num_samples, seed, clip, saveFile, sorted):
     for i in range(len(weights)):
         weights[i] = weights[i] / sum
 
+    # weights = torch.tensor(weights)
+    # softmax = torch.nn.Softmax(dim=0)
+    # weights = softmax(weights)
+    # weights = weights.tolist()
+
     if clip is not None:
         for i in range(len(weights)):
             if weights[i] < clip / 9815:
-                weights[i] = clip / 9815
+                # weights[i] = clip / 9815
+                weights[i] = 0
 
-    weights = torch.tensor(weights, device='cuda')
-    ActiveSampler = torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=num_samples, replacement=False)
-    sample_index = [j for j in ActiveSampler]
-    if sorted:
-        for i in range(len(sample_index)):
-            for j in range(i+1, len(sample_index)):
-                if weights[i] < weights[j]:
-                    sample_index[i], sample_index[j] = sample_index[j], sample_index[i]
-    active_datasets = bert_datasets['validation_matched'].select(sample_index)
-    active_eval_dataloader = torch.utils.data.DataLoader(active_datasets, batch_size=1, shuffle=False)
+    with open('/home/qinpeixin/InteractiveEvaluation/Classification/result_1145.csv', 'w') as f:
+        write_head = ['method', 'num_samples', 'acc_mean', 'acc_var', 'mse']
+        writer = csv.writer(f)
+        writer.writerow([true_loss_num])
+        writer.writerow(write_head)
+        for num_samples in num_samples_list:
+            random_list = []
+            active_list = []
+            active_error = []
+            random_error = []
+            for seed in seed_list:
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed(seed)
 
-    i = 0
-    N = 9815
-    M = num_samples
+                randomSampler = torch.utils.data.RandomSampler(range(len(true_loss)), num_samples=num_samples)
+                random_sample_index = [j for j in randomSampler]
 
-    weights = weights.tolist()
-    total_loss = 0
-    mean_loss = 0
-    with open('/home/qinpeixin/InteractiveEvaluation/Classification/weights_accuracy_clip.csv', 'w') as f:
-        for batch in active_eval_dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                outputs = bert(**batch)
+                random_loss = 0
+                for i in random_sample_index:
+                    random_loss += true_loss[i]
+                random_loss = random_loss / len(random_sample_index)
+                if metric == 'loss':
+                    random_list.append(random_loss)
+                elif metric == 'accuracy':
+                    random_list.append(1 - random_loss)
+                random_error.append((random_loss - true_loss_num) ** 2)
 
-            if metric == 'loss':
-                loss = outputs.loss.item()
-            elif metric == 'accuracy':
-                arg = torch.argmax(outputs.logits, dim=1).item()
-                if arg == batch['labels'].item():
-                    loss = 0
-                else:
-                    loss = 1
+                weights = torch.tensor(weights, device='cuda')
+                ActiveSampler = torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=num_samples,
+                                                                       replacement=False)
+                weights = weights.tolist()
+                active_sample_index = [j for j in ActiveSampler]
 
-            m = i + 1
-            if m == 9815:
-                v = 1
-            else:
-                v = 1 + (1 / ((N - m + 1) * (weights[sample_index[i]])) - 1) * (N - M) / (N - m)
-            total_loss += v * loss
-            mean_loss += loss
+                # for i in range(len(active_sample_index)):
+                #     for j in range(i + 1, len(active_sample_index)):
+                #         if weights[i] < weights[j]:
+                #             active_sample_index[i], active_sample_index[j] = active_sample_index[j], \
+                #                                                              active_sample_index[i]
+                N = len(true_loss)
+                M = num_samples
 
-            if saveFile:
-                write_data = [weights[sample_index[i]], loss, v]
-                writer = csv.writer(f)
-                writer.writerow(write_data)
+                active_loss = 0
+                for i in range(len(active_sample_index)):
+                    j = active_sample_index[i]
+                    m = i + 1
+                    v = 1 + (1 / ((N - m + 1) * (weights[j])) - 1) * (N - M) / (N - m)
 
-            i += 1
+                    active_loss += v * true_loss[j]
 
-    unbiased_loss = total_loss / M
-    mean_loss = mean_loss / M
-
-    print("unbiased_loss:" + str(unbiased_loss))
-    print("mean_loss:" + str(mean_loss))
-
-    trainer = Trainer(
-        model=bert,
-        args=training_args,
-        train_dataset=None,
-        eval_dataset=random_eval_dataset,
-        compute_metrics=compute_metrics,
-    )
-
-    metrics = trainer.evaluate()
-    trainer.log_metrics("eval", metrics)
-
-    return unbiased_loss, metrics
+                active_loss = active_loss / len(active_sample_index)
+                if metric == 'loss':
+                    active_list.append(active_loss)
+                elif metric == 'accuracy':
+                    active_list.append(1 - active_loss)
+                active_error.append((active_loss - true_loss_num) ** 2)
+            random_mean = np.mean(random_list)
+            random_var = np.var(random_list)
+            active_mean = np.mean(active_list)
+            active_var = np.var(active_list)
+            random_err = np.mean(random_error)
+            active_err = np.mean(active_error)
+            print(active_var)
+            print(active_err)
+            write_data1 = ['active', num_samples, active_mean, active_var, active_err]
+            write_data2 = ['random', num_samples, random_mean, random_var, random_err]
+            writer.writerow(write_data1)
+            writer.writerow(write_data2)
 
 
 if __name__ == '__main__':
-    num_samples_list = [64, 128, 256, 512, 1024]
-    seeds = [42, 912, 323, 2023, 1914, 1024, 10086, 406, 401, 318]
-    # clips = [None, 0.1, 0.2, 0.3, 0.4, 0.5]
-    clips = [0.2]
-    with open('/home/qinpeixin/InteractiveEvaluation/Classification/result2.csv', 'w') as f:
-        write_head = ['method', 'num_samples', 'clip', 'loss_mean', 'loss_var', 'acc_mean', 'acc_var']
-        writer = csv.writer(f)
-        writer.writerow(write_head)
-        for num_samples in num_samples_list:
-            for clip in clips:
-                loss_list = []
-                acc_list = []
-                for seed in seeds:
-                    unbiased_loss, metrics_ = main('loss', num_samples, seed, clip, False, True)
-                    accuracy_, metric_ = main('accuracy', num_samples, seed, clip, False, True)
-                    accuracy_ = 1 - accuracy_
-                    # write_data1 = ['active', num_samples, clip, seed, unbiased_loss, accuracy_]
-                    # write_data2 = ['random', num_samples, clip, seed, metric_['eval_loss'], metric_['eval_accuracy']]
-                    # writer.writerow(write_data1)
-                    # writer.writerow(write_data2)
-                    loss_list.append(unbiased_loss)
-                    acc_list.append(accuracy_)
-                loss_mean = np.mean(loss_list)
-                loss_var = np.var(loss_list)
-                acc_mean = np.mean(acc_list)
-                acc_var = np.var(acc_list)
-                write_data = ['active', num_samples, clip, loss_mean, loss_var, acc_mean, acc_var]
-                writer.writerow(write_data)
+    num_samples_list = [256]
+
+    seeds = [42, 912, 323, 2023, 1914, 1024, 10086, 406, 401, 318, 1650, 411, 5515, 114, 514, 2, 10, 5,
+             200, 1797, 21, 1637, 10124, 3912, 321, 8914, 8003, 2083, 165, 184, 708, 1499, 5523, 8551,
+             8927, 6807, 98004, 988, 1708, 928, 81, 17647, 2809, 87, 29, 1411, 74, 14174, 14117, 90543,
+             27231, 8480, 1825, 2001, 4769, 2377, 9784, 1107, 1456, 6348, 1838, 3285, 53, 4931, 6027]
+
+    # seeds = [42, 912, 323, 2023, 1914, 1024, 10086, 406, 401, 318]
+
+    main('loss', num_samples_list, seeds, 0.4)
